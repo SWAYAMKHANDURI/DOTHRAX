@@ -13,36 +13,6 @@
  *   - Full persistence via window.storage (survives page reloads)
  *   - All 7 Qdrant API methods: createCollection, upsert, search,
  *     retrieve, scroll, count, deleteCollection
- *
- * ── SWAP TO REAL QDRANT ───────────────────────────────────────────────────
- * In vectorMemory.js, replace:
- *
- *   import { QdrantMockClient as qdrant } from "./qdrant.js";
- *
- * with:
- *
- *   import { QdrantClient } from "@qdrant/js-client-rest";
- *   const qdrant = new QdrantClient({ url: "http://localhost:6333" });
- *   // or Qdrant Cloud:
- *   const qdrant = new QdrantClient({
- *     url: import.meta.env.VITE_QDRANT_URL,
- *     apiKey: import.meta.env.VITE_QDRANT_API_KEY,
- *   });
- *
- * The rest of the codebase is identical — collection names, upsert/search
- * call signatures, and payload shapes are all preserved.
- * ─────────────────────────────────────────────────────────────────────────
- *
- * ── LOCAL DEV PERSISTENCE ─────────────────────────────────────────────────
- * Replace persist() and hydrate() bodies to use localStorage:
- *
- *   const persist = (name, points) =>
- *     localStorage.setItem(`qdrant:${name}`, JSON.stringify(points));
- *
- *   const hydrate = (name) => {
- *     const raw = localStorage.getItem(`qdrant:${name}`);
- *     return raw ? JSON.parse(raw) : [];
- *   };
  * ─────────────────────────────────────────────────────────────────────────
  */
 
@@ -122,22 +92,14 @@ export const textToVector = (text, dims = 128) => {
 
 const storageKey = (name) => `qdrant:${name}`;
 
-const persist = async (name, points) => {
-  try {
-    await window.storage.set(storageKey(name), JSON.stringify(points));
-  } catch (e) {
-    console.warn(`[Qdrant] persist(${name}) failed:`, e);
-  }
-};
+    const persist = (name, points) =>
+     localStorage.setItem(`qdrant:${name}`, JSON.stringify(points));
+ 
+    const hydrate = (name) => {
+      const raw = localStorage.getItem(`qdrant:${name}`);
+      return raw ? JSON.parse(raw) : [];
+    };
 
-const hydrate = async (name) => {
-  try {
-    const r = await window.storage.get(storageKey(name));
-    return r ? JSON.parse(r.value) : [];
-  } catch {
-    return [];
-  }
-};
 
 // ── In-memory store ────────────────────────────────────────────────────────────
 
