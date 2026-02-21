@@ -3,42 +3,45 @@
  * Production-grade vector memory system built on QdrantMockClient.
  *
  * Collections:
- * ┌─────────────────────┬────────────────────────────────────────────────────┐
- * │ research_history    │ Every query + summary. Semantic search finds        │
- * │                     │ similar past research to inject as context.         │
- * ├─────────────────────┼────────────────────────────────────────────────────┤
- * │ user_preferences    │ Extracted preferences keyed by domain. Retrieved   │
- * │                     │ by topic so ML prefs surface for ML questions.      │
- * ├─────────────────────┼────────────────────────────────────────────────────┤
- * │ key_insights        │ Distilled facts/conclusions from deep dives.        │
- * │                     │ Retrieved as RAG context for follow-up questions.  │
- * ├─────────────────────┼────────────────────────────────────────────────────┤
- * │ conversations       │ Full conversation turns (user+assistant pairs).     │
- * │                     │ Enables "continue where we left off" across         │
- * │                     │ sessions.                                           │
- * └─────────────────────┴────────────────────────────────────────────────────┘
+ * ┌──────────────────────┬──────────────────────────────────────────────────┐
+ * │ research_history     │ Every query + summary. Semantic search finds     │
+ * │                      │ similar past research to inject as context.      │
+ * ├──────────────────────┼──────────────────────────────────────────────────┤
+ * │ user_preferences     │ Extracted prefs keyed by domain. ML prefs        │
+ * │                      │ surface for ML questions, not web questions.     │
+ * ├──────────────────────┼──────────────────────────────────────────────────┤
+ * │ key_insights         │ Distilled facts from deep dives. Retrieved as    │
+ * │                      │ RAG context for follow-up questions.             │
+ * ├──────────────────────┼──────────────────────────────────────────────────┤
+ * │ conversations        │ Full user+assistant turn pairs. Cross-session    │
+ * │                      │ continuity — "continue where we left off".       │
+ * └──────────────────────┴──────────────────────────────────────────────────┘
  *
- * Retrieval pipeline (called before every Claude request):
- *   embed(query) → search all 4 collections → rank → deduplicate → inject
+ * Retrieval pipeline (runs before every Claude call):
+ *   embed(query) → Promise.all 4 searches → rank → deduplicate → inject
  */
 
 import { QdrantMockClient as qdrant, textToVector } from "./qdrant.js";
 
-// ── Collection definitions ─────────────────────────────────────────────────
+// ── Collection names ────────────────────────────────────────────────────────
 
 export const COLLECTIONS = {
-  RESEARCH_HISTORY:  "research_history",
-  USER_PREFERENCES:  "user_preferences",
-  KEY_INSIGHTS:      "key_insights",
-  CONVERSATIONS:     "conversations",
+  RESEARCH_HISTORY: "research_history",
+  USER_PREFERENCES: "user_preferences",
+  KEY_INSIGHTS:     "key_insights",
+  CONVERSATIONS:    "conversations",
 };
 
 const VECTOR_CONFIG = { size: 128, distance: "Cosine" };
 
-// ── Initialisation ─────────────────────────────────────────────────────────
+// ── Initialisation ──────────────────────────────────────────────────────────
 
 let _initialized = false;
 
+/**
+ * Create all 4 collections if they don't exist.
+ * Idempotent — safe to call multiple times.
+ */
 export const initMemory = async () => {
   if (_initialized) return;
   await Promise.all(
@@ -49,19 +52,21 @@ export const initMemory = async () => {
   _initialized = true;
 };
 
-// ── ID helpers ─────────────────────────────────────────────────────────────
+// ── ID helper ───────────────────────────────────────────────────────────────
 
 const uid = () => `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-// ── WRITE operations ───────────────────────────────────────────────────────
+// ── WRITE operations ────────────────────────────────────────────────────────
 
 /**
  * Store a completed research query + response summary.
+ *
+ * @param {{ query, summary, mode, tags, responsePreview }} params
  */
 export const storeResearch = async ({ query, summary, mode, tags = [], responsePreview = "" }) => {
   await initMemory();
   const vector = textToVector(`${query} ${summary} ${tags.join(" ")}`);
-  await qdrant.upsert(COLLECTIONS.RESEARCH_HISTORY, {
+  return qdrant.upsert(COLLECTIONS.RESEARCH_HISTORY, {
     points: [{
       id: uid(),
       vector,
@@ -71,22 +76,23 @@ export const storeResearch = async ({ query, summary, mode, tags = [], responseP
         mode,
         tags,
         responsePreview: responsePreview.slice(0, 400),
-        timestamp: Date.now(),
+        timestamp:       Date.now(),
       },
     }],
   });
 };
 
 /**
- * Store or update a user preference. One point per preference key,
- * upserted so duplicates don't accumulate.
+ * Store or update a user preference.
+ * Uses a deterministic id so the same key/domain pair overwrites itself.
+ *
+ * @param {{ key, value, domain, example }} params
  */
 export const storePreference = async ({ key, value, domain = "general", example = "" }) => {
   await initMemory();
-  // Use deterministic id so same key overwrites itself
-  const id = `pref-${key}-${domain}`;
+  const id     = `pref-${key}-${domain}`; // deterministic → no duplicates
   const vector = textToVector(`user preference ${key} ${value} ${domain} ${example}`);
-  await qdrant.upsert(COLLECTIONS.USER_PREFERENCES, {
+  return qdrant.upsert(COLLECTIONS.USER_PREFERENCES, {
     points: [{
       id,
       vector,
@@ -96,12 +102,14 @@ export const storePreference = async ({ key, value, domain = "general", example 
 };
 
 /**
- * Store a distilled insight/fact extracted from a deep dive.
+ * Store a distilled insight extracted from a deep dive.
+ *
+ * @param {{ insight, topic, sourceQuery, tags }} params
  */
 export const storeInsight = async ({ insight, topic, sourceQuery = "", tags = [] }) => {
   await initMemory();
   const vector = textToVector(`${insight} ${topic} ${tags.join(" ")}`);
-  await qdrant.upsert(COLLECTIONS.KEY_INSIGHTS, {
+  return qdrant.upsert(COLLECTIONS.KEY_INSIGHTS, {
     points: [{
       id: uid(),
       vector,
@@ -111,13 +119,20 @@ export const storeInsight = async ({ insight, topic, sourceQuery = "", tags = []
 };
 
 /**
- * Store a conversation turn (user message + assistant response pair).
+ * Store a full conversation turn (user + assistant).
  * Enables cross-session continuity.
+ *
+ * @param {{ userMessage, assistantMessage, mode, sessionId }} params
  */
-export const storeConversationTurn = async ({ userMessage, assistantMessage, mode, sessionId = "default" }) => {
+export const storeConversationTurn = async ({
+  userMessage,
+  assistantMessage,
+  mode,
+  sessionId = "default",
+}) => {
   await initMemory();
   const vector = textToVector(`${userMessage} ${assistantMessage.slice(0, 300)}`);
-  await qdrant.upsert(COLLECTIONS.CONVERSATIONS, {
+  return qdrant.upsert(COLLECTIONS.CONVERSATIONS, {
     points: [{
       id: uid(),
       vector,
@@ -132,19 +147,20 @@ export const storeConversationTurn = async ({ userMessage, assistantMessage, mod
   });
 };
 
-// ── READ / RETRIEVAL operations ────────────────────────────────────────────
+// ── READ / RETRIEVAL operations ─────────────────────────────────────────────
 
 /**
- * Core retrieval pipeline. Given a query, searches all 4 collections
- * and returns a structured context object ready for prompt injection.
+ * Core retrieval pipeline.
+ * Embeds the query, searches all 4 collections in parallel,
+ * and returns a structured context object.
  *
- * @param {string} query - The incoming user query
+ * @param {string} query
  * @param {{ limit?: number, minScore?: number }} opts
- * @returns {MemoryContext}
+ * @returns {Promise<MemoryContext>}
  */
 export const retrieveContext = async (query, opts = {}) => {
   await initMemory();
-  const { limit = 4, minScore = 0.25 } = opts;
+  const { limit = 4, minScore = 0.2 } = opts;
   const vector = textToVector(query);
 
   const [historyHits, prefHits, insightHits, convHits] = await Promise.all([
@@ -163,68 +179,55 @@ export const retrieveContext = async (query, opts = {}) => {
   ]);
 
   return {
-    similarResearch:   historyHits.map(h => ({ ...h.payload, _score: h.score })),
-    relevantPrefs:     prefHits.map(h => ({ ...h.payload, _score: h.score })),
-    relevantInsights:  insightHits.map(h => ({ ...h.payload, _score: h.score })),
-    relatedConversations: convHits.map(h => ({ ...h.payload, _score: h.score })),
+    similarResearch:      historyHits.map((h) => ({ ...h.payload, _score: h.score })),
+    relevantPrefs:        prefHits.map((h)    => ({ ...h.payload, _score: h.score })),
+    relevantInsights:     insightHits.map((h) => ({ ...h.payload, _score: h.score })),
+    relatedConversations: convHits.map((h)    => ({ ...h.payload, _score: h.score })),
   };
 };
 
 /**
- * Retrieve all stored preferences (for the memory panel UI).
+ * Retrieve all stored preferences (used by the memory panel UI).
  */
 export const getAllPreferences = async () => {
   await initMemory();
   const { points } = await qdrant.scroll(COLLECTIONS.USER_PREFERENCES, {
     limit: 100, with_payload: true,
   });
-  return points.map(p => p.payload);
+  return points.map((p) => p.payload);
 };
 
 /**
- * Retrieve recent research history (for the memory panel UI).
+ * Retrieve recent research history sorted by timestamp desc (used by memory panel).
+ *
+ * @param {number} [limit=20]
  */
 export const getRecentHistory = async (limit = 20) => {
   await initMemory();
   const { points } = await qdrant.scroll(COLLECTIONS.RESEARCH_HISTORY, {
-    limit: 100, with_payload: true,
+    limit: 200, with_payload: true,
   });
   return points
-    .map(p => p.payload)
+    .map((p) => p.payload)
     .sort((a, b) => b.timestamp - a.timestamp)
     .slice(0, limit);
 };
 
 /**
- * Retrieve recent conversation turns (for session continuity).
- */
-export const getRecentConversations = async (limit = 10) => {
-  await initMemory();
-  const { points } = await qdrant.scroll(COLLECTIONS.CONVERSATIONS, {
-    limit: 50, with_payload: true,
-  });
-  return points
-    .map(p => p.payload)
-    .sort((a, b) => b.timestamp - a.timestamp)
-    .slice(0, limit);
-};
-
-/**
- * Get collection stats for the UI.
+ * Get collection point counts for the memory panel stats display.
  */
 export const getMemoryStats = async () => {
   await initMemory();
-  const stats = await Promise.all(
+  return Promise.all(
     Object.entries(COLLECTIONS).map(async ([label, name]) => {
       const { result } = await qdrant.getCollection(name);
       return { label, name, count: result.points_count };
     })
   );
-  return stats;
 };
 
 /**
- * Clear all memory (used by the "Clear" button in the UI).
+ * Wipe all 4 collections. Called by the "Clear All" button.
  */
 export const clearAllMemory = async () => {
   await Promise.all(
@@ -233,10 +236,11 @@ export const clearAllMemory = async () => {
   _initialized = false;
 };
 
-// ── Prompt injection helper ────────────────────────────────────────────────
+// ── Prompt injection ────────────────────────────────────────────────────────
 
 /**
- * Format retrieved context into a structured string for system prompt injection.
+ * Format a MemoryContext object into a structured markdown string
+ * for injection into the system prompt.
  * Only includes sections that have content.
  *
  * @param {object} ctx - Result from retrieveContext()
@@ -247,18 +251,26 @@ export const formatContextForPrompt = (ctx) => {
 
   if (ctx.relevantPrefs?.length) {
     sections.push(
-      "## Learned User Preferences (from vector memory)\n" +
+      "## Learned User Preferences (semantic retrieval from Qdrant)\n" +
       ctx.relevantPrefs
-        .map(p => `- [${p.domain}] ${p.key}: ${JSON.stringify(p.value)}${p.example ? ` (e.g. "${p.example}")` : ""}  (similarity: ${p._score?.toFixed(2)})`)
+        .map((p) =>
+          `- [${p.domain}] ${p.key}: ${JSON.stringify(p.value)}` +
+          (p.example ? ` — e.g. "${p.example}"` : "") +
+          ` (similarity: ${p._score?.toFixed(2)})`
+        )
         .join("\n")
     );
   }
 
   if (ctx.similarResearch?.length) {
     sections.push(
-      "## Semantically Similar Past Research (retrieved from vector store)\n" +
+      "## Semantically Similar Past Research (from Qdrant)\n" +
       ctx.similarResearch
-        .map(r => `- [${r.mode}] "${r.query}"\n  Summary: ${r.summary}\n  Tags: ${(r.tags || []).join(", ")}  (similarity: ${r._score?.toFixed(2)})`)
+        .map((r) =>
+          `- [${r.mode}] "${r.query}"\n` +
+          `  Summary: ${r.summary}\n` +
+          `  Tags: ${(r.tags || []).join(", ")} (similarity: ${r._score?.toFixed(2)})`
+        )
         .join("\n")
     );
   }
@@ -267,7 +279,9 @@ export const formatContextForPrompt = (ctx) => {
     sections.push(
       "## Relevant Key Insights (distilled from prior deep dives)\n" +
       ctx.relevantInsights
-        .map(i => `- [${i.topic}] ${i.insight}  (similarity: ${i._score?.toFixed(2)})`)
+        .map((i) =>
+          `- [${i.topic}] ${i.insight} (similarity: ${i._score?.toFixed(2)})`
+        )
         .join("\n")
     );
   }
@@ -276,12 +290,17 @@ export const formatContextForPrompt = (ctx) => {
     sections.push(
       "## Related Prior Conversations (for continuity)\n" +
       ctx.relatedConversations
-        .map(c => `- User asked: "${c.userMessage}"\n  Agent responded: "${c.assistantMessage.slice(0, 200)}..."  (similarity: ${c._score?.toFixed(2)})`)
+        .map((c) =>
+          `- User asked: "${c.userMessage}"\n` +
+          `  Agent responded: "${c.assistantMessage.slice(0, 200)}..." (similarity: ${c._score?.toFixed(2)})`
+        )
         .join("\n")
     );
   }
 
-  if (sections.length === 0) return "No relevant memory found for this query.";
+  if (sections.length === 0) {
+    return "No relevant memory found for this query.";
+  }
 
   return "# Retrieved Memory Context (Qdrant Semantic Search)\n\n" + sections.join("\n\n");
 };
